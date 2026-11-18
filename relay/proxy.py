@@ -15,6 +15,7 @@ from starlette.types import Receive, Scope, Send
 
 from .config import Config
 from .generations import Generation, HOP_BY_HOP, InFlightRequest, RelayState
+from . import release_diff
 
 log = logging.getLogger("relay.proxy")
 
@@ -68,6 +69,10 @@ class SwitchRequest(BaseModel):
     wait_timeout: float = Field(30.0, gt=0, le=30.0, description="Max seconds to wait")
 
 
+class ReleaseDiffRequest(BaseModel):
+    target: str = Field(..., description="Candidate target name from RELAY_TARGETS", min_length=1)
+
+
 class RelayApp:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -118,7 +123,13 @@ class RelayApp:
                 "`RELAY_DRAIN_SECONDS` (default 5s); when the window expires only that "
                 "generation's unfinished requests are interrupted. Requests on newer "
                 "generations are untouched.\n"
-                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n\n"
+                "* Response bodies are forwarded chunk by chunk, never buffered whole.\n"
+                "* `POST /api/release-diff` compares the release manifests "
+                "(`/release-manifest.json`) of the current generation and a candidate "
+                "target. Both manifests must be HTTP 200 with a strong `ETag`; before "
+                "publishing the diff the relay revalidates both with conditional "
+                "requests and re-checks the current generation. Any change, a failed "
+                "revalidation, or a generation switch yields 409 and no diff.\n\n"
                 "Open **GET /demo** for a click-through download demo."
             ),
             lifespan=self.lifespan,
@@ -126,6 +137,7 @@ class RelayApp:
         app.get("/api/status", tags=["relay"])(self.api_status)
         app.get("/api/targets", tags=["relay"])(self.api_targets)
         app.post("/api/switch", tags=["relay"])(self.api_switch)
+        app.post("/api/release-diff", tags=["relay"])(self.api_release_diff)
         app.get("/api/operations/{operation_id}", tags=["relay"])(self.api_operation)
         app.get("/demo", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         app.get("/", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
@@ -174,6 +186,105 @@ class RelayApp:
             if operation.id == operation_id:
                 return JSONResponse({"operation": operation.to_dict()}, headers=JSON_HEADERS)
         raise HTTPException(status_code=404, detail=f"no operation {operation_id}")
+
+    async def api_release_diff(self, body: ReleaseDiffRequest) -> Response:
+        """Diff the release manifests of the current generation and a candidate.
+
+        The diff is only published when both manifests were fetched as 200 with
+        strong ETags, both still revalidate to those ETags via conditional
+        requests, and the current generation has not switched in the meantime.
+        Every failure path returns an error object *without* any diff fields.
+        """
+        if body.target not in self.config.targets:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown target {body.target!r}; known: {sorted(self.config.targets)}",
+            )
+        candidate = self.config.targets[body.target]
+        # Snapshot the generation that is current at accept time.  This runs
+        # synchronously before the first await, so a concurrent commit either
+        # happened before (we see the new generation) or after (we detect the
+        # switch below and return 409).
+        generation = self.state.current
+        current_src = release_diff.Source(
+            side="current", name=generation.target_name, base_url=generation.base_url
+        )
+        candidate_src = release_diff.Source(
+            side="candidate", name=candidate.name, base_url=candidate.base_url
+        )
+        session = self.state.probe_session
+        timeout = self.config.manifest_timeout
+        try:
+            current_manifest, candidate_manifest = await release_diff.fetch_pair(
+                session, current_src, candidate_src, timeout
+            )
+        except release_diff.ManifestError as exc:
+            log.info("release-diff vs %s aborted: %s", candidate.name, exc.detail)
+            return JSONResponse(
+                {
+                    "error": exc.error,
+                    "detail": exc.detail,
+                    "side": exc.side,
+                    "candidate": candidate.name,
+                    "generation": generation.id,
+                },
+                status_code=502,
+                headers=JSON_HEADERS,
+            )
+        # Both manifests are parsed; confirm they are still current before
+        # publishing anything derived from them.
+        try:
+            await release_diff.revalidate_pair(
+                session,
+                current_src,
+                current_manifest.etag,
+                candidate_src,
+                candidate_manifest.etag,
+                timeout,
+            )
+        except release_diff.ManifestConflict as exc:
+            log.info("release-diff vs %s conflicted: %s", candidate.name, exc.detail)
+            return JSONResponse(
+                {
+                    "error": exc.error,
+                    "detail": exc.detail,
+                    "side": exc.side,
+                    "candidate": candidate.name,
+                    "generation_at_accept": generation.id,
+                    "current_generation": self.state.current.id,
+                },
+                status_code=409,
+                headers=JSON_HEADERS,
+            )
+        if self.state.current is not generation:
+            return JSONResponse(
+                {
+                    "error": "generation_switched",
+                    "detail": (
+                        f"current generation switched from {generation.id} to "
+                        f"{self.state.current.id} while comparing; rerun the diff"
+                    ),
+                    "candidate": candidate.name,
+                    "generation_at_accept": generation.id,
+                    "current_generation": self.state.current.id,
+                },
+                status_code=409,
+                headers=JSON_HEADERS,
+            )
+        diff = release_diff.diff_manifests(current_manifest, candidate_manifest)
+        payload = {
+            "candidate": candidate.name,
+            "current_target": generation.target_name,
+            "current_generation": generation.id,
+            "etags": {"current": current_manifest.etag, "candidate": candidate_manifest.etag},
+            "summary": {
+                "missing_in_candidate": len(diff["missing_in_candidate"]),
+                "digest_mismatch": len(diff["digest_mismatch"]),
+                "added_in_candidate": len(diff["added_in_candidate"]),
+            },
+            **diff,
+        }
+        return JSONResponse(payload, headers=JSON_HEADERS)
 
     async def demo_page(self) -> HTMLResponse:
         return HTMLResponse(DEMO_HTML)
@@ -515,6 +626,19 @@ DEMO_HTML = """<!doctype html>
   <code>curl -X POST 'http://localhost:9002/_control/probe?delay=4'</code>.
   Add <code>&amp;status=503</code> to make the probe fail.</p>
 
+<h2>Release diff</h2>
+<p>Compare <code>/release-manifest.json</code> of the current generation with a candidate
+  (both manifests are revalidated with conditional requests before the diff is shown).</p>
+<div class="row">
+  <button onclick="releaseDiff('blue')">Diff current vs blue</button>
+  <button onclick="releaseDiff('green')">Diff current vs green</button>
+</div>
+<pre id="diff-result">no diff requested yet</pre>
+<p class="muted">Edit a manifest live:
+  <code>curl -X POST http://localhost:9001/_control/manifest -H 'content-type: application/json'
+  -d '{"set":{"artifacts/x.bin":"&lt;64 hex chars&gt;"}}'</code>
+  (<code>remove</code> takes a list of paths, <code>"reset":true</code> restores the default).</p>
+
 <script>
 async function refresh() {
   try {
@@ -538,6 +662,15 @@ async function switchTo(target) {
   document.getElementById('switch-msg').textContent = r.status + ' ' + j.operation.status +
     (j.operation.reason ? ' — ' + j.operation.reason : '');
   refresh();
+}
+async function releaseDiff(target) {
+  document.getElementById('diff-result').textContent = `comparing current vs ${target}…`;
+  const r = await fetch('/api/release-diff', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({target})
+  });
+  const j = await r.json();
+  document.getElementById('diff-result').textContent = r.status + '\n' + JSON.stringify(j, null, 2);
 }
 refresh();
 setInterval(refresh, 1000);

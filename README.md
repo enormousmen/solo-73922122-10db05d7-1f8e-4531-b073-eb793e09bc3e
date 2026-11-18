@@ -26,6 +26,7 @@
 | 慢探活不挡切换/查询 | 探活是独立任务，`POST /api/switch` 默认立刻返回 202（`wait=true` 才阻塞，且可设超时）；`/api/status` 是纯同步快照，不取锁、不 await 任何网络 |
 | 慢下载不挡切换/查询 | 探活与代理使用**两个独立的 aiohttp session/连接池**；控制面不等待任何下载 |
 | `/docs` 可切换、查目标与各代在途数 | OpenAPI 见 `/docs`；`GET /api/status` 返回当前目标/代、各代状态与 `in_flight`、进行中的请求明细；`/demo` 是可视化演示页 |
+| 切流前核对两边发布清单 | `POST /api/release-diff` 从受理时现行代与候选目标分别拉取 `/release-manifest.json`（路径 → SHA-256，≤200 项、≤64KiB，仅接受 200 + 强 ETag），给出差异前先用条件请求（`If-None-Match`）复核两份清单未变、并确认现行代未切换；任一变化或验证失败返回 409 且不给出任何部分差异，读取/格式错误返回 502 同样不给差异 |
 
 补充约定：
 
@@ -67,6 +68,22 @@ curl -X POST http://localhost:8080/api/switch \
 curl http://localhost:8080/api/status | python3 -m json.tool
 ```
 
+两个上游还在 `/release-manifest.json` 提供可修改的发布清单（强 ETag，支持
+`If-None-Match` 条件请求，匹配时返回 304）。默认清单里两边各有一个独有制品、
+一个摘要不同的条目，所以切流前可以直接看到三类差异：
+
+```bash
+# 切流前核对：候选缺件 / 同路径摘要不符 / 新增制品 + 双方 ETag + 现行代号
+curl -X POST http://localhost:8080/api/release-diff \
+  -H 'content-type: application/json' -d '{"target":"green"}' | python3 -m json.tool
+
+# 查看/修改 green 的清单（set 设条目、remove 删条目、reset 恢复默认）
+curl http://localhost:9002/_control/manifest | python3 -m json.tool
+curl -X POST http://localhost:9002/_control/manifest \
+  -H 'content-type: application/json' \
+  -d '{"set":{"artifacts/new-tool.tar":"'"$(printf 'c%.0s' $(seq 64))"'"},"remove":["artifacts/runtime.tar"]}'
+```
+
 下载演示脚本（先起 compose，或者用下面的本地方式）：
 
 ```bash
@@ -104,6 +121,7 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
 | `RELAY_HOST` / `RELAY_PORT` | `0.0.0.0` / `8080` | 监听地址 |
 | `RELAY_SHUTDOWN_GRACE_SECONDS` | `5` | 退出时等长下载收尾的上限，超时后强制断开并 abort 所有代 |
 | `RELAY_MAX_CLOSED_GENERATIONS` | `100` | 状态里保留的已关闭代数（活跃/收尾中的代永远不会被裁掉） |
+| `RELAY_MANIFEST_TIMEOUT` | `5` | `/api/release-diff` 单次清单读取与条件复核的总超时（秒） |
 
 ## 控制面 API
 
@@ -116,6 +134,20 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
   `in_flight_requests[]`）、`recent_operations[]`（最近 50 次）。
 * `GET /api/operations/{id}` — 单次切换的最终状态。
 * `GET /api/targets` — 目标表 + 当前目标。
+* `POST /api/release-diff` — body `{"target": "green"}`。比较**受理时现行代**与候选目标的
+  `/release-manifest.json`：
+  * 成功 `200`：`missing_in_candidate`（候选缺件）、`digest_mismatch`（同路径摘要不符，
+    附双方摘要）、`added_in_candidate`（候选新增制品），外加 `summary` 计数、两份清单的
+    `etags`、`current_target` / `current_generation`，供值班员决定是否切流。
+  * `409`：比较期间任一清单变更（`manifest_changed`）、条件请求未能确认清单未变
+    （`revalidation_failed`）、或现行代发生切换（`generation_switched`，附
+    `generation_at_accept` 与新的 `current_generation`）。**不携带任何差异字段**。
+  * `502`：清单读取失败（连接/超时/非 200）或格式不符（非 JSON、非对象、超过 200 项、
+    超过 64KiB、摘要不是 64 位十六进制、缺失/弱 ETag），`side` 指明是现行侧还是候选侧。
+    同样不携带差异字段。
+  * 未知目标 `404`，body 不合法 `422`。
+  * 清单请求走控制面连接池（与下载流量隔离），单次读取/复核超时为
+    `RELAY_MANIFEST_TIMEOUT`（默认 5s）。
 
 ## 设计要点（为什么这么做）
 
@@ -141,4 +173,6 @@ python -m pytest -q
 
 `tests/` 分两层：`test_switch_unit.py` 用假探活 session 覆盖状态机（失败保留、supersede、
 迟到 200、drain 只作用于本代、回切同址、no-op）；`test_proxy_integration.py` 起真实
-TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等。
+TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等；
+`test_release_diff.py` 覆盖清单比较（三类差异、条件复核、清单变更/代切换 409、
+读取与格式错误 502 且不出差异）。

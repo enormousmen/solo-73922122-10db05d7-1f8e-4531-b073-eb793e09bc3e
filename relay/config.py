@@ -27,6 +27,7 @@ class Config:
     chunk_size: int
     host: str
     port: int
+    manifest_timeout: float = 5.0
     max_closed_generations: int = 100
 
 
@@ -89,6 +90,9 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         raise ValueError("RELAY_PROBE_TIMEOUT must be > 0")
     connect_timeout = _env_float(e, "RELAY_CONNECT_TIMEOUT", 5.0)
     sock_read_timeout = _env_float(e, "RELAY_SOCK_READ_TIMEOUT", 0.0)
+    manifest_timeout = _env_float(e, "RELAY_MANIFEST_TIMEOUT", 5.0)
+    if manifest_timeout <= 0:
+        raise ValueError("RELAY_MANIFEST_TIMEOUT must be > 0")
     chunk_size = int(e.get("RELAY_CHUNK_SIZE", "65536"))
     if chunk_size <= 0:
         raise ValueError("RELAY_CHUNK_SIZE must be > 0")
@@ -109,5 +113,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         chunk_size=chunk_size,
         host=e.get("RELAY_HOST", "0.0.0.0"),
         port=int(e.get("RELAY_PORT", "8080")),
+        manifest_timeout=manifest_timeout,
         max_closed_generations=max_closed,
     )

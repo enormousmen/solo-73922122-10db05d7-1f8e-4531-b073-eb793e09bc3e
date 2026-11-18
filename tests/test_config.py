@@ -33,3 +33,12 @@ def test_bad_generation_history_limit():
 def test_probe_path_is_normalized():
     assert load_config({"RELAY_PROBE_PATH": "ready"}).probe_path == "/ready"
     assert load_config({"RELAY_PROBE_PATH": "/healthz"}).probe_path == "/healthz"
+
+
+def test_manifest_timeout_config():
+    assert load_config({}).manifest_timeout == 5.0
+    assert load_config({"RELAY_MANIFEST_TIMEOUT": "1.5"}).manifest_timeout == 1.5
+    with pytest.raises(ValueError):
+        load_config({"RELAY_MANIFEST_TIMEOUT": "0"})
+    with pytest.raises(ValueError):
+        load_config({"RELAY_MANIFEST_TIMEOUT": "-1"})
